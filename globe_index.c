@@ -4,6 +4,294 @@
 
 static const char zstd_magic[] = { 0x28, 0xb5, 0x2f, 0xfd };
 
+// === Columnar Trace Compression ===
+// Magic: "TRC1" - distinguishes columnar format from raw fourState
+#define TRACE_COLUMNAR_MAGIC 0x54524331U
+
+// LEB128 varint encode unsigned
+static uint8_t *varint_enc_u64(uint8_t *p, uint64_t v) {
+    do {
+        uint8_t byte = v & 0x7f;
+        v >>= 7;
+        if (v) byte |= 0x80;
+        *p++ = byte;
+    } while (v);
+    return p;
+}
+
+// LEB128 varint encode signed (zigzag)
+static uint8_t *varint_enc_s64(uint8_t *p, int64_t v) {
+    uint64_t zigzag = (uint64_t)(v << 1) ^ (uint64_t)(v >> 63);
+    do {
+        uint8_t byte = zigzag & 0x7f;
+        zigzag >>= 7;
+        if (zigzag) byte |= 0x80;
+        *p++ = byte;
+    } while (zigzag);
+    return p;
+}
+
+// LEB128 varint decode unsigned
+static const uint8_t *varint_dec_u64(const uint8_t *p, uint64_t *v) {
+    *v = 0;
+    unsigned shift = 0;
+    while (1) {
+        uint8_t byte = *p++;
+        *v |= ((uint64_t)(byte & 0x7f)) << shift;
+        if (!(byte & 0x80)) break;
+        shift += 7;
+    }
+    return p;
+}
+
+// LEB128 varint decode signed (zigzag)
+static const uint8_t *varint_dec_s64(const uint8_t *p, int64_t *v) {
+    uint64_t zigzag;
+    p = varint_dec_u64(p, &zigzag);
+    *v = (int64_t)(zigzag >> 1) ^ -(int64_t)(zigzag & 1);
+    return p;
+}
+
+// Transform interleaved fourState array to compact per-field varint encoding.
+// Returns number of bytes written to out, or 0 on error.
+static int transformTraceChunk(fourState *source, int numStates, uint8_t *out, int outSize) {
+    // rough upper bound for worst-case varints (11 fields × ~5 bytes each)
+    if (outSize < 16 + numStates * 55) return 0;
+
+    *(uint32_t *)out = TRACE_COLUMNAR_MAGIC;
+    *(uint32_t *)(out + 4) = (uint32_t)numStates;
+
+    int64_t base_ts = getState(source, 0)->timestamp;
+    memcpy(out + 8, &base_ts, 8);
+
+    uint8_t *p = out + 16;
+
+    // Single-pass: encode all 11 fields per state sequentially
+    for (int i = 0; i < numStates; i++) {
+        struct state *si = getState(source, i);
+        struct state *sp = (i == 0) ? NULL : getState(source, i - 1);
+
+        // timestamp: delta from previous
+        int64_t ts_delta = (i == 0) ? 0 : (si->timestamp - sp->timestamp);
+        p = varint_enc_s64(p, ts_delta);
+
+        // lat: delta from previous (starting from 0 at i==0)
+        int64_t lat_delta = (i == 0) ? (int64_t)si->lat : ((int64_t)si->lat - (int64_t)sp->lat);
+        p = varint_enc_s64(p, lat_delta);
+
+        // lon: delta from previous (starting from 0 at i==0)
+        int64_t lon_delta = (i == 0) ? (int64_t)si->lon : ((int64_t)si->lon - (int64_t)sp->lon);
+        p = varint_enc_s64(p, lon_delta);
+
+        // flags: packed uint16_t, XOR diff from previous
+        uint16_t flags = ((uint16_t)si->on_ground << 0) | ((uint16_t)si->stale << 1) |
+                         ((uint16_t)si->leg_marker << 2) | ((uint16_t)si->gs_valid << 3) |
+                         ((uint16_t)si->track_valid << 4) | ((uint16_t)si->baro_alt_valid << 5) |
+                         ((uint16_t)si->baro_rate_valid << 6) | ((uint16_t)si->geom_alt_valid << 7) |
+                         ((uint16_t)si->geom_rate_valid << 8) | ((uint16_t)si->roll_valid << 9) |
+                         ((uint16_t)si->ias_valid << 10);
+        uint16_t fdiff = (i == 0) ? flags : (flags ^ ((uint16_t)sp->on_ground |
+                         ((uint16_t)sp->stale << 1) | ((uint16_t)sp->leg_marker << 2) |
+                         ((uint16_t)sp->gs_valid << 3) | ((uint16_t)sp->track_valid << 4) |
+                         ((uint16_t)sp->baro_alt_valid << 5) | ((uint16_t)sp->baro_rate_valid << 6) |
+                         ((uint16_t)sp->geom_alt_valid << 7) | ((uint16_t)sp->geom_rate_valid << 8) |
+                         ((uint16_t)sp->roll_valid << 9) | ((uint16_t)sp->ias_valid << 10)));
+        p = varint_enc_u64(p, fdiff);
+
+        // gs: delta from previous
+        int32_t gs_delta = (i == 0) ? (int32_t)si->gs : ((int32_t)si->gs - (int32_t)sp->gs);
+        p = varint_enc_s64(p, gs_delta);
+
+        // track: delta from previous
+        int32_t track_delta = (i == 0) ? (int32_t)si->track : ((int32_t)si->track - (int32_t)sp->track);
+        p = varint_enc_s64(p, track_delta);
+
+        // baro_alt: delta from previous
+        int32_t ba_delta = (i == 0) ? (int32_t)si->baro_alt : ((int32_t)si->baro_alt - (int32_t)sp->baro_alt);
+        p = varint_enc_s64(p, ba_delta);
+
+        // baro_rate: raw value
+        p = varint_enc_s64(p, si->baro_rate);
+
+        // geom_alt: delta from previous
+        int32_t ga_delta = (i == 0) ? (int32_t)si->geom_alt : ((int32_t)si->geom_alt - (int32_t)sp->geom_alt);
+        p = varint_enc_s64(p, ga_delta);
+
+        // geom_rate: raw value
+        p = varint_enc_s64(p, si->geom_rate);
+
+        // ias+roll+addrtype: packed, XOR diff from previous
+        uint32_t packed = ((uint32_t)si->ias & 0xfff) |
+                          (((uint32_t)(uint16_t)si->roll & 0xfff) << 12) |
+                          (((uint32_t)si->addrtype & 0x1f) << 24);
+        uint32_t pdiff = packed;
+        if (i != 0) {
+            uint32_t prev = ((uint32_t)sp->ias & 0xfff) |
+                            (((uint32_t)(uint16_t)sp->roll & 0xfff) << 12) |
+                            (((uint32_t)sp->addrtype & 0x1f) << 24);
+            pdiff = packed ^ prev;
+        }
+        p = varint_enc_u64(p, pdiff);
+    }
+
+    // --- Per-fourState: state_all ---
+    // First stored in full, rest as full XOR against first (ZSTD compresses the zero runs)
+    struct state_all *firstAll = getStateAll(source, 0);
+    if (!firstAll) firstAll = &source[0].zeroAll;
+    memcpy(p, firstAll, sizeof(struct state_all)); p += sizeof(struct state_all);
+
+    int n4 = numStates / SFOUR;
+    for (int i = 1; i < n4; i++) {
+        struct state_all *cur = getStateAll(source, i * SFOUR);
+        if (!cur) cur = &source[i].zeroAll;
+        for (size_t j = 0; j < sizeof(struct state_all); j++)
+            p[j] = ((const uint8_t *)cur)[j] ^ ((const uint8_t *)firstAll)[j];
+        p += sizeof(struct state_all);
+    }
+
+    return (int)(p - out);
+}
+
+// Expand columnar buffer(s) back to fourState array.
+// Handles multiple concatenated TRC1 sections (from chunk extension).
+// Returns total number of states expanded, or 0 on error.
+static int expandTraceChunk(const uint8_t *in, int inSize, fourState *dest, int maxStates) {
+    const uint8_t *end = in + inSize;
+    int total_states = 0;
+
+    while (in < end) {
+        if (end - in < 16) return 0;
+
+        uint32_t magic = *(const uint32_t *)in; in += 4;
+        if (magic != TRACE_COLUMNAR_MAGIC) return 0;
+
+        uint32_t numStates = *(const uint32_t *)in; in += 4;
+        if (numStates % SFOUR != 0 || numStates == 0) return 0;
+        if ((int)numStates > maxStates - total_states) return 0;
+
+        int64_t base_ts;
+        memcpy(&base_ts, in, 8); in += 8;
+
+        int numFourStates = numStates / SFOUR;
+
+        // Single-pass: decode all 11 fields per state sequentially
+        int64_t prev_ts = base_ts;
+        int64_t prev_lat = 0;
+        int64_t prev_lon = 0;
+        uint16_t prev_flags = 0;
+        int32_t prev_gs = 0;
+        int32_t prev_track = 0;
+        int32_t prev_baro_alt = 0;
+        int32_t prev_geom_alt = 0;
+        uint32_t prev_packed = 0;
+
+        for (uint32_t i = 0; i < numStates; i++) {
+            struct state *si = getState(dest, total_states + i);
+
+            // timestamp
+            int64_t ts_delta;
+            in = varint_dec_s64(in, &ts_delta);
+            prev_ts += ts_delta;
+            si->timestamp = prev_ts;
+
+            // lat
+            int64_t lat_delta;
+            in = varint_dec_s64(in, &lat_delta);
+            prev_lat += lat_delta;
+            si->lat = (int32_t)prev_lat;
+
+            // lon
+            int64_t lon_delta;
+            in = varint_dec_s64(in, &lon_delta);
+            prev_lon += lon_delta;
+            si->lon = (int32_t)prev_lon;
+
+            // flags
+            uint64_t flags_raw;
+            in = varint_dec_u64(in, &flags_raw);
+            uint16_t cur_flags = (i == 0) ? (uint16_t)flags_raw : (prev_flags ^ (uint16_t)flags_raw);
+            prev_flags = cur_flags;
+            si->on_ground      = (cur_flags >> 0) & 1;
+            si->stale          = (cur_flags >> 1) & 1;
+            si->leg_marker     = (cur_flags >> 2) & 1;
+            si->gs_valid       = (cur_flags >> 3) & 1;
+            si->track_valid    = (cur_flags >> 4) & 1;
+            si->baro_alt_valid = (cur_flags >> 5) & 1;
+            si->baro_rate_valid = (cur_flags >> 6) & 1;
+            si->geom_alt_valid = (cur_flags >> 7) & 1;
+            si->geom_rate_valid = (cur_flags >> 8) & 1;
+            si->roll_valid     = (cur_flags >> 9) & 1;
+            si->ias_valid      = (cur_flags >> 10) & 1;
+
+            // gs
+            int64_t gs_delta;
+            in = varint_dec_s64(in, &gs_delta);
+            prev_gs += (int32_t)gs_delta;
+            si->gs = (uint16_t)prev_gs;
+
+            // track
+            int64_t track_delta;
+            in = varint_dec_s64(in, &track_delta);
+            prev_track += (int32_t)track_delta;
+            si->track = (uint16_t)prev_track;
+
+            // baro_alt
+            int64_t ba_delta;
+            in = varint_dec_s64(in, &ba_delta);
+            prev_baro_alt += (int32_t)ba_delta;
+            si->baro_alt = (int16_t)prev_baro_alt;
+
+            // baro_rate
+            int64_t baro_rate;
+            in = varint_dec_s64(in, &baro_rate);
+            si->baro_rate = (int16_t)baro_rate;
+
+            // geom_alt
+            int64_t ga_delta;
+            in = varint_dec_s64(in, &ga_delta);
+            prev_geom_alt += (int32_t)ga_delta;
+            si->geom_alt = (int16_t)prev_geom_alt;
+
+            // geom_rate
+            int64_t geom_rate;
+            in = varint_dec_s64(in, &geom_rate);
+            si->geom_rate = (int16_t)geom_rate;
+
+            // ias_roll+addrtype
+            uint64_t packed_raw;
+            in = varint_dec_u64(in, &packed_raw);
+            uint32_t cur_packed = (i == 0) ? (uint32_t)packed_raw : (prev_packed ^ (uint32_t)packed_raw);
+            prev_packed = cur_packed;
+            si->ias = cur_packed & 0xfff;
+            int roll12 = (int)((cur_packed >> 12) & 0xfff);
+            if (roll12 & 0x800) roll12 |= ~0xfff; // sign extend 12-bit
+            si->roll = roll12;
+            si->addrtype = (addrtype_t)((cur_packed >> 24) & 0x1f);
+        }
+
+        // Decode state_all: first is raw, rest are XOR against first
+        struct state_all *firstAll = getStateAll(dest, total_states);
+        if (firstAll) {
+            if ((size_t)(end - in) < sizeof(struct state_all)) return 0;
+            memcpy(firstAll, in, sizeof(struct state_all)); in += sizeof(struct state_all);
+
+            for (int i = 1; i < numFourStates; i++) {
+                struct state_all *cur = getStateAll(dest, total_states + i * SFOUR);
+                if (!cur) return 0;
+                uint8_t *cb = (uint8_t *)cur;
+                if ((size_t)(end - in) < sizeof(struct state_all)) return 0;
+                for (size_t j = 0; j < sizeof(struct state_all); j++)
+                    cb[j] = in[j] ^ ((const uint8_t *)firstAll)[j];
+                in += sizeof(struct state_all);
+            }
+        }
+
+        total_states += numStates;
+    }
+
+    return total_states;
+}
+
 static void mark_legs(traceBuffer tb, struct aircraft *a, int start, int recent);
 static traceBuffer reassembleTrace(struct aircraft *a, int numPoints, int64_t after_timestamp, threadpool_buffer_t *buffer);
 static void resizeTraceCurrent(struct aircraft *a, int64_t now, int extra, int force);
@@ -1971,10 +2259,16 @@ static traceBuffer reassembleTrace(struct aircraft *a, int numPoints, int64_t af
     traceBuffer tb = { 0 };
 
     //fprintf(stderr, "allocLen %ld fourStates %ld stateBytes %ld\n", (long) allocLen, (long) getFourStates(allocLen), (long) stateBytes(allocLen));
-    tb.trace = check_grow_threadpool_buffer_t(buffer, stateBytes(allocLen));
+    // Allocate extra space for temp decompression buffer (max one chunk's stateBytes)
+    int maxChunkBytes = 0;
+    for (int k = firstChunk; k < a->trace_chunk_len; k++) {
+        int cb = stateBytes(a->trace_chunks[k].numStates);
+        if (cb > maxChunkBytes) maxChunkBytes = cb;
+    }
+    tb.trace = check_grow_threadpool_buffer_t(buffer, stateBytes(allocLen) + maxChunkBytes);
 
     fourState *tp = tb.trace;
-
+    char *decompTemp = (char *)tb.trace + stateBytes(allocLen);
 
     int actual_len = 0;
     for (int k = firstChunk; k < a->trace_chunk_len; k++) {
@@ -1987,12 +2281,27 @@ static traceBuffer reassembleTrace(struct aircraft *a, int numPoints, int64_t af
         if (!buffer->dctx) {
             buffer->dctx = ZSTD_createDCtx();
         }
-        size_t res = ZSTD_decompressDCtx(buffer->dctx, tp, uncompressed_len, chunk->compressed, chunk->compressed_size);
+
+        // Decompress to temp area first (data may be columnar format)
+        size_t res = ZSTD_decompressDCtx(buffer->dctx, decompTemp, uncompressed_len, chunk->compressed, chunk->compressed_size);
         if (ZSTD_isError(res)) {
             fprintf(stderr, "reassembleTrace() zstd error: %s\n", ZSTD_getErrorName(res));
             tb.len = 0;
             traceCleanup(a);
             goto exit;
+        }
+
+        if (res >= 4 && *(uint32_t *)decompTemp == TRACE_COLUMNAR_MAGIC) {
+            int states = expandTraceChunk((const uint8_t *)decompTemp, (int)res, tp, chunk->numStates);
+            if (states != chunk->numStates) {
+                fprintf(stderr, "reassembleTrace() expand error: expected %d states, got %d\n", chunk->numStates, states);
+                tb.len = 0;
+                traceCleanup(a);
+                goto exit;
+            }
+        } else {
+            // Old format: raw fourState data
+            memcpy(tp, decompTemp, uncompressed_len);
         }
 
         tp += getFourStates(chunk->numStates);
@@ -2031,13 +2340,34 @@ static float recompressStateChunk(struct aircraft *a, struct stateChunk *chunk, 
     }
     int uncompressed_len = stateBytes(chunk->numStates);
     int maxSize = ZSTD_compressBound(uncompressed_len);
-    int totalBuffer = uncompressed_len + maxSize;
-    char *uncompressed = check_grow_threadpool_buffer_t(passbuffer, totalBuffer);
-    char *compressed = uncompressed + uncompressed_len;
+    // Buffer layout: [decompTemp][fourState expansion][compressed output]
+    int totalBuffer = uncompressed_len + uncompressed_len + maxSize;
+    char *decompTemp = check_grow_threadpool_buffer_t(passbuffer, totalBuffer);
+    char *fourStateBuf = decompTemp + uncompressed_len;
+    char *compressed = fourStateBuf + uncompressed_len;
 
-    size_t res = ZSTD_decompressDCtx(passbuffer->dctx, uncompressed, uncompressed_len, chunk->compressed, chunk->compressed_size);
+    size_t res = ZSTD_decompressDCtx(passbuffer->dctx, decompTemp, uncompressed_len, chunk->compressed, chunk->compressed_size);
     if (ZSTD_isError(res)) {
         fprintf(stderr, "recompress(): Corrupt trace chunk: zstd error: %s\n", ZSTD_getErrorName(res));
+        return 0.0f;
+    }
+
+    // Expand columnar format if needed, to get raw fourState for re-transform
+    if (res >= 4 && *(uint32_t *)decompTemp == TRACE_COLUMNAR_MAGIC) {
+        int states = expandTraceChunk((const uint8_t *)decompTemp, (int)res, (fourState *)fourStateBuf, chunk->numStates);
+        if (states != chunk->numStates) {
+            fprintf(stderr, "recompress(): expand error: expected %d states, got %d\n", chunk->numStates, states);
+            return 0.0f;
+        }
+    } else {
+        // Old format: raw fourState data
+        memcpy(fourStateBuf, decompTemp, uncompressed_len);
+    }
+
+    // Re-transform to columnar format before recompression
+    int columnarLen = transformTraceChunk((fourState *)fourStateBuf, chunk->numStates, (uint8_t *)decompTemp, uncompressed_len);
+    if (columnarLen <= 0) {
+        fprintf(stderr, "recompress(): transform error\n");
         return 0.0f;
     }
 
@@ -2047,7 +2377,7 @@ static float recompressStateChunk(struct aircraft *a, struct stateChunk *chunk, 
     size_t compressedSize = ZSTD_compressCCtx(
             passbuffer->cctx,
             compressed, maxSize,
-            uncompressed, uncompressed_len,
+            decompTemp, columnarLen,
             2);
 
     if (ZSTD_isError(compressedSize)) {
@@ -2266,7 +2596,16 @@ static int compressChunk(fourState *source, int pointCount, threadpool_buffer_t 
         // when asking zstd to decompress the concatenated range of bytes, it will transparently
         // decompress all those concatenated compressed objects
 
-        int maxSize = ZSTD_compressBound(newBytes);
+        // Transform source to columnar format for better ZSTD compression
+        uint8_t *columnarBuf = cmalloc(newBytes);
+        int columnarLen = transformTraceChunk(source, pointCount, columnarBuf, newBytes);
+        if (columnarLen <= 0) {
+            fprintf(stderr, "compressChunk() transform error\n");
+            sfree(columnarBuf);
+            exit(1);
+        }
+
+        int maxSize = ZSTD_compressBound(columnarLen);
         int totalBuffer = maxSize;
         if (extending) {
             totalBuffer += target->compressed_size;
@@ -2284,8 +2623,10 @@ static int compressChunk(fourState *source, int pointCount, threadpool_buffer_t 
         compressedSize = ZSTD_compressCCtx(
                 passbuffer->cctx,
                 compressed, maxSize,
-                source, newBytes,
+                columnarBuf, columnarLen,
                 compressionLvl);
+
+        sfree(columnarBuf);
 
         if (ZSTD_isError(compressedSize)) {
             fprintf(stderr, "compressChunk() zstd error: %s\n", ZSTD_getErrorName(compressedSize));
