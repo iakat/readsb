@@ -1,49 +1,47 @@
-FROM ghcr.io/wiedehopf/readsb-builder:latest AS builder
+FROM debian:trixie AS builder
 
 ARG MARCH_AMD64="-march=znver4 -mtune=znver4"
 
 SHELL ["/bin/bash", "-x", "-o", "pipefail", "-c"]
-RUN --mount=type=bind,source=.,target=/app/git \
-    cd /app/git && \
-    READSB_BUILD_DIR=$(mktemp -d) && \
-    cp -aT /app/git $READSB_BUILD_DIR && \
-    cd $READSB_BUILD_DIR && \
-    [[ $(uname -m) == x86_64 ]] && MARCH=" $MARCH_AMD64" || MARCH="" && \
-    make -j$(nproc) RTLSDR=yes OPTIMIZE="-O2 $MARCH" &&\
-    mv readsb /usr/local/bin && \
-    mv viewadsb /usr/local/bin && \
-    chmod +x /usr/local/bin/viewadsb /usr/local/bin/readsb && \
+RUN apt-get update && \
+    apt-get -y install --no-install-recommends \
+    gcc make pkg-config libc6-dev \
+    librtlsdr-dev libusb-1.0-0-dev \
+    zlib1g-dev libzstd-dev libncurses-dev \
+    wget ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . /src
+
+RUN [[ $(uname -m) == x86_64 ]] && MARCH=" $MARCH_AMD64" || MARCH="" && \
+    mkdir -p /out/share/tar1090 && \
+    make -j$(nproc) RTLSDR=yes OPTIMIZE="-O2 $MARCH" && \
+    mv readsb /out/readsb && \
+    mv viewadsb /out/viewadsb && \
     make clean && \
     make -j$(nproc) WITH_UUIDS=yes OPTIMIZE="-O2 $MARCH" && \
-    mv readsb /usr/local/bin/readsb-with-uuids && \
+    mv readsb /out/readsb-with-uuids && \
     make clean && \
     make -j$(nproc) PRINT_UUIDS=yes TRACKS_UUID=yes OPTIMIZE="-O2 $MARCH" && \
-    mv readsb /usr/local/bin/readsb-uuid && \
-    mv viewadsb /usr/local/bin/viewadsb-uuid && \
-    chmod +x /usr/local/bin/viewadsb-uuid && \
-    chmod +x /usr/local/bin/readsb-uuid && \
-    rm -rf $READSB_BUILD_DIR && \
-    mkdir -p  /usr/local/share/tar1090 && \
-    wget --timeout 10 --tries=6 --retry-connrefused --retry-on-http-error=404,429,500,502,503,504 -O /usr/local/share/tar1090/aircraft.csv.gz https://raw.githubusercontent.com/wiedehopf/tar1090-db/csv/aircraft.csv.gz && \
-    true
+    mv readsb /out/readsb-uuid && \
+    mv viewadsb /out/viewadsb-uuid && \
+    wget --timeout 10 --tries=6 --retry-connrefused --retry-on-http-error=404,429,500,502,503,504 -O /out/share/tar1090/aircraft.csv.gz https://raw.githubusercontent.com/wiedehopf/tar1090-db/csv/aircraft.csv.gz
 
 FROM debian:trixie-slim
-RUN \
-    --mount=type=bind,from=builder,source=/,target=/builder/ \
-    apt-get update && \
+RUN apt-get update && \
     apt-get -y install --no-install-recommends \
-    librtlsdr0 libncurses6 zlib1g libzstd1 && \
+    librtlsdr0 libncurses6 zlib1g libzstd1 libjemalloc2 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
-    mkdir -p /run/readsb && \
-    cp /builder/usr/local/bin/readsb* /usr/local/bin/ && \
-    cp /builder/usr/local/bin/viewadsb* /usr/local/bin/ && \
-    mkdir -p  /usr/local/share/tar1090 && \
-    cp /builder/usr/local/share/tar1090/aircraft.csv.gz /usr/local/share/tar1090/aircraft.csv.gz && \
-    cp /builder/usr/local/lib/libjemalloc.so.2 /usr/local/lib/libjemalloc.so.2 && \
-    true
+    mkdir -p /run/readsb /usr/local/share/tar1090
 
-ENV LD_PRELOAD=/usr/local/lib/libjemalloc.so.2
+COPY --from=builder /out/readsb /out/readsb-with-uuids /out/readsb-uuid /usr/local/bin/
+COPY --from=builder /out/viewadsb /out/viewadsb-uuid /usr/local/bin/
+COPY --from=builder /out/share/tar1090/aircraft.csv.gz /usr/local/share/tar1090/aircraft.csv.gz
+
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 ENV MALLOC_CONF=narenas:1,tcache:false
 
 ENTRYPOINT ["/usr/local/bin/readsb"]
