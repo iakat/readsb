@@ -1776,8 +1776,8 @@ static void kineticNextTsPrefix(unsigned char out[4]);
 
 static void modesSendBeastOutput(struct modesMessage *mm, struct net_writer *writer) {
     int msgLen = mm->msgbits / 8;
-    // 0x1a 0xe3 receiverId(2*8) 0x1a msgType timestamp+signal(2*7) message(2*msgLen)
-    char *p = prepareWrite(writer, (2 + 2 * 8 + 2 + 2 * 7) + 2 * msgLen);
+    // 0x1a 0xe4 uuid(36) 0x1a 0xe3 receiverId(2*8) 0x1a msgType timestamp+signal(2*7) message(2*msgLen)
+    char *p = prepareWrite(writer, (2 + 36 + 2 + 2 * 8 + 2 + 2 * 7) + 2 * msgLen);
     unsigned char ch;
     int sig;
     unsigned char *msg = (Modes.net_verbatim ? mm->verbatim : mm->msg);
@@ -1791,6 +1791,9 @@ static void modesSendBeastOutput(struct modesMessage *mm, struct net_writer *wri
     // only send the receiverId when it changes
     if (Modes.netReceiverId && writer->lastReceiverId != mm->receiverId) {
         writer->lastReceiverId = mm->receiverId;
+        // 0xe3 carries only the first half of the uuid
+        if (Modes.beastOutUUID && writer == &Modes.beast_out && mm->client && !Modes.incrementId)
+            p = sprint_uuid(mm->client->receiverId, mm->client->receiverId2, memcpy(p, "\x1a\xe4", 2) + 2);
         *p++ = 0x1a;
         // other dump1090 / readsb versions or beast implementations should discard unknown message types
         *p++ = 0xe3; // good enough guess no one is using this.
