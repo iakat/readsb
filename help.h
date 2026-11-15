@@ -165,6 +165,7 @@ static struct argp_option optionsReadsb[] = {
     {"net-beast-reduce-filter-alt", OptNetBeastReduceFilterAlt, "<pressure altitude in ft>", 0, "beast-reduce: remove aircraft which are above altitude", 2},
     {"net-sbs-reduce", OptNetSbsReduce, 0, 0, "Apply beast reduce logic and interval to SBS outputs", 2},
     {"net-receiver-id", OptNetReceiverId, 0, 0, "forward receiver ID", 2},
+    {"beast-out-uuid", OptBeastOutUUID, 0, 0, "beast_out: send the full uuid before the receiver id", 2},
     {"net-ingest", OptNetIngest, 0, 0, "primary ingest node", 2},
     {"net-garbage", OptGarbage, "<ports>", 0, "timeout receivers, output messages from timed out receivers as beast on <ports>", 2},
     {"decode-threads", OptDecodeThreads, "<n>", 0, "Number of decode threads, either 1 or 2 (default: 1). Only use 2 when you have beast traffic > 200 MBit/s, expect 1.4x speedup for 2x CPU", 2},

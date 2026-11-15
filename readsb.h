@@ -783,6 +783,7 @@ struct _Modes
     int8_t ping;
     int8_t netReceiverIdPrint;
     int8_t netReceiverIdJson;
+    int8_t beastOutUUID;
     int8_t netIngest;
     int8_t readProxy;
     int8_t enableClientsJson;
@@ -1372,6 +1373,7 @@ enum {
     OptNetVerbatim,
     OptNetReceiverId,
     OptNetReceiverIdJson,
+    OptBeastOutUUID,
     OptNetIngest,
     OptSdrBufSize,
     OptGarbage,
