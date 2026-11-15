@@ -1,12 +1,14 @@
 FROM ghcr.io/wiedehopf/readsb-builder:latest AS builder
 
+ARG MARCH_AMD64="-march=znver4 -mtune=znver4"
+
 SHELL ["/bin/bash", "-x", "-o", "pipefail", "-c"]
 RUN --mount=type=bind,source=.,target=/app/git \
     cd /app/git && \
     READSB_BUILD_DIR=$(mktemp -d) && \
     cp -aT /app/git $READSB_BUILD_DIR && \
     cd $READSB_BUILD_DIR && \
-    [[ $(uname -m) == x86_64 ]] && MARCH=" -march=nehalem" || MARCH="" && \
+    [[ $(uname -m) == x86_64 ]] && MARCH=" $MARCH_AMD64" || MARCH="" && \
     make -j$(nproc) RTLSDR=yes OPTIMIZE="-O2 $MARCH" &&\
     mv readsb /usr/local/bin && \
     mv viewadsb /usr/local/bin && \
